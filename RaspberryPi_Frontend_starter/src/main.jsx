@@ -3,283 +3,134 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
-const SCAN_ENDPOINT = import.meta.env.VITE_SCAN_ENDPOINT || "/api/scans";
 const ML_ENDPOINT = import.meta.env.VITE_ML_ENDPOINT || "/api/scans/analyze";
-const RESULT_ENDPOINT = import.meta.env.VITE_RESULT_ENDPOINT || "/YOUR_EXISTING_RESULT_ENDPOINT";
-const HEALTH_ENDPOINT = import.meta.env.VITE_HEALTH_ENDPOINT || "/health";
-
+const RESULT_ENDPOINT = import.meta.env.VITE_RESULT_ENDPOINT || "/api/scans";
 const CHANNELS = ["ch450", "ch500", "ch550", "ch570", "ch600", "ch650"];
-
-function parseCsvLine(line) {
-  const values = [];
-  let value = "";
-  let quoted = false;
-
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index];
-    if (character === '"' && line[index + 1] === '"' && quoted) {
-      value += '"';
-      index += 1;
-    } else if (character === '"') {
-      quoted = !quoted;
-    } else if (character === "," && !quoted) {
-      values.push(value.trim());
-      value = "";
-    } else {
-      value += character;
-    }
-  }
-
-  values.push(value.trim());
-  return values;
-}
 
 function parseCsv(text) {
   const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).filter((line) => line.trim());
-  if (lines.length !== 10) throw new Error(`CSV must contain exactly 10 readings; found ${lines.length}.`);
-
-  return lines.map((line, rowIndex) => {
-    const values = parseCsvLine(line);
-    if (values.length !== CHANNELS.length) {
-      throw new Error(`Row ${rowIndex + 1} must contain exactly 6 columns.`);
-    }
-    const reading = {};
-    CHANNELS.forEach((channel, channelIndex) => {
-      const rawValue = values[channelIndex];
-      const numericValue = Number(rawValue);
-      if (rawValue === "" || !Number.isFinite(numericValue)) {
-        throw new Error(`Row ${rowIndex + 1} has an invalid value in column ${channelIndex + 1}.`);
-      }
-      reading[channel] = numericValue;
-    });
-    return reading;
+  if (lines.length < 10) throw new Error(`CSV must contain at least 10 readings; found ${lines.length}.`);
+  const firstRow = lines[0].split(",").map((value) => value.trim().toLowerCase());
+  const hasHeader = CHANNELS.every((channel) => firstRow.includes(channel));
+  const columnIndexes = hasHeader ? CHANNELS.map((channel) => firstRow.indexOf(channel)) : CHANNELS.map((_, index) => index);
+  const dataLines = (hasHeader ? lines.slice(1) : lines).slice(0, 10);
+  if (dataLines.length < 10) throw new Error(`CSV must contain at least 10 readings; found ${dataLines.length}.`);
+  return dataLines.map((line, rowIndex) => {
+    const values = line.split(",").map((value) => value.trim());
+    if (columnIndexes.some((index) => index >= values.length)) throw new Error(`Row ${rowIndex + 1} is missing a spectral channel.`);
+    return Object.fromEntries(CHANNELS.map((channel, index) => {
+      const value = Number(values[columnIndexes[index]]);
+      if (!Number.isFinite(value)) throw new Error(`Row ${rowIndex + 1} has an invalid numeric value.`);
+      return [channel, value];
+    }));
   });
+}
+
+function formatTimestamp(value) {
+  if (!value) return "Just now";
+  return new Date(value).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+function normalizeResult(data) {
+  const model = data.result || data.ml_result || data;
+  const scan = data.scan || data;
+  const finalStatus = String(model.final_status || scan.final_status || "suspicious").toLowerCase();
+  return {
+    verdict: ["genuine", "counterfeit", "suspicious"].includes(finalStatus) ? finalStatus : "suspicious",
+    scanId: scan.scan_id,
+    medicine: model.medicine || model.medicine_name || scan.medicine_name || "Unknown",
+    confidence: model.classification_confidence ?? scan.confidence_score,
+    anomalyScore: model.anomaly_score ?? scan.anomaly_score,
+    scanData: model.scan_data || {},
+    timestamp: scan.timestamp,
+    scan,
+    raw: data
+  };
+}
+
+function Metric({ label, value, percent }) {
+  return <div className="metric"><span>{label}</span><strong>{value} <small>/ 1.00</small></strong><i><em style={{ width: `${percent}%` }} /></i></div>;
 }
 
 function App() {
   const [screen, setScreen] = useState("scan");
   const [status, setStatus] = useState("ready");
   const [result, setResult] = useState(null);
+  const [recentScans, setRecentScans] = useState([]);
   const [error, setError] = useState("");
   const [backendOnline, setBackendOnline] = useState(false);
   const [csvFile, setCsvFile] = useState(null);
   const [readings, setReadings] = useState([]);
 
-  useEffect(() => {
-    checkHealth();
-  }, []);
+  useEffect(() => { checkHealth(); loadRecentScans(); }, []);
 
   async function checkHealth() {
+    try { setBackendOnline((await fetch(`${API_BASE}/health`)).ok); }
+    catch { setBackendOnline(false); }
+  }
+
+  async function loadRecentScans() {
     try {
-      const response = await fetch(`${API_BASE}${HEALTH_ENDPOINT}`, { signal: AbortSignal.timeout(2500) });
-      setBackendOnline(response.ok);
-    } catch {
-      setBackendOnline(false);
-    }
+      const response = await fetch(`${API_BASE}/api/scans/?limit=4`);
+      if (response.ok) setRecentScans(await response.json());
+    } catch { setRecentScans([]); }
   }
 
   async function handleCsvChange(event) {
     const file = event.target.files?.[0];
-    setError("");
-    setCsvFile(file || null);
-    setReadings([]);
+    setError(""); setCsvFile(file || null); setReadings([]);
     if (!file) return;
-
-    try {
-      setReadings(parseCsv(await file.text()));
-    } catch (err) {
-      setCsvFile(null);
-      setError(err.message || "Unable to read the CSV file.");
-      event.target.value = "";
-    }
+    try { setReadings(parseCsv(await file.text())); }
+    catch (err) { setCsvFile(null); setError(err.message || "Unable to read the CSV file."); event.target.value = ""; }
   }
 
   async function startScan() {
-    setError("");
-    setResult(null);
-    setStatus("scanning");
-    setScreen("scan");
-
-    try {
-      const response = await fetch(`${API_BASE}${ML_ENDPOINT}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ readings })
-      });
-
-      if (!response.ok) {
-        let detail = `Backend returned ${response.status}`;
-        try {
-          const errorBody = await response.json();
-          detail = errorBody.detail || detail;
-        } catch {
-          // Keep the HTTP status when the server did not return JSON.
-        }
-        throw new Error(detail);
-      }
-
-      const data = await response.json();
-      const normalized = normalizeResult(data);
-      setResult(normalized);
-      setStatus("complete");
-      setScreen("result");
-    } catch (err) {
-      setStatus("error");
-      setError(err.message || "Unable to communicate with the authentication backend.");
+    if (readings.length !== 10) {
+      setError(`Please upload a CSV with at least 10 valid spectral readings. The file currently has ${readings.length}/10.`);
+      return;
     }
+    setError(""); setResult(null); setStatus("scanning");
+    try {
+      const response = await fetch(`${API_BASE}${ML_ENDPOINT}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ readings }) });
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || `Backend returned ${response.status}`);
+      const normalized = normalizeResult(await response.json());
+      setResult(normalized); setRecentScans((scans) => [normalized.scan, ...scans.filter((scan) => scan.scan_id !== normalized.scan?.scan_id)].slice(0, 4)); setStatus("complete"); setScreen("result");
+    } catch (err) { setStatus("error"); setError(err.message || "Unable to communicate with the authentication backend."); }
   }
 
   async function fetchResult() {
     try {
-      const response = await fetch(`${API_BASE}${RESULT_ENDPOINT}`);
+      if (!result?.scanId) throw new Error("No saved scan is available to refresh.");
+      const response = await fetch(`${API_BASE}${RESULT_ENDPOINT}/${result.scanId}`);
       if (!response.ok) throw new Error(`Backend returned ${response.status}`);
-      const data = await response.json();
-      setResult(normalizeResult(data));
-      setStatus("complete");
-      setScreen("result");
-      setError("");
-    } catch (err) {
-      setError(err.message || "Unable to fetch the authentication result.");
-    }
+      setResult(normalizeResult(await response.json())); setError("");
+    } catch (err) { setError(err.message || "Unable to fetch the authentication result."); }
   }
 
-  function normalizeResult(data) {
-    const raw = JSON.stringify(data).toLowerCase();
-    let verdict = "suspicious";
-    if (raw.includes("genuine") || raw.includes("authentic")) verdict = "genuine";
-    if (raw.includes("counterfeit") || raw.includes("fake")) verdict = "counterfeit";
-    if (raw.includes("suspicious") || raw.includes("anomaly")) verdict = "suspicious";
+  function newScan() { setResult(null); setError(""); setStatus("ready"); setScreen("scan"); }
+  const confidence = result?.confidence == null ? 0 : Math.round(Number(result.confidence) * 100);
+  const anomaly = result?.anomalyScore == null ? 0 : Math.min(100, Math.round(Number(result.anomalyScore)));
 
-    const modelResult = data.result || data;
-    const finalStatus = String(modelResult.final_status || "").toLowerCase();
-    if (["genuine", "counterfeit", "suspicious"].includes(finalStatus)) {
-      verdict = finalStatus;
-    }
-
-    return {
-      verdict,
-      medicine: modelResult.medicine || modelResult.medicine_name || "Unknown",
-      confidence: modelResult.classification_confidence,
-      anomalyScore: modelResult.anomaly_score,
-      status: modelResult.final_status || verdict.toUpperCase(),
-      raw: data
-    };
-  }
-
-  return (
-    <main className="app">
-      <header className="topbar">
-        <div>
-          <div className="brand">MEDICINE AUTHENTICATION</div>
-          <div className="subtitle">AI assisted preliminary screening</div>
-        </div>
-        <div className={`connection ${backendOnline ? "online" : "offline"}`}>
-          <span className="dot" />
-          {backendOnline ? "SYSTEM READY" : "BACKEND OFFLINE"}
-        </div>
-      </header>
-
-      {screen === "scan" && (
-        <section className="screen scan-screen">
-          <div className="hero">
-            <span className="eyebrow">AUTHENTICATION TERMINAL</span>
-            <h1>{status === "scanning" ? "Scanning medicine sample" : "Ready for authentication"}</h1>
-            <p>
-              Place the medicine sample in the sensing unit and start the authentication process.
-            </p>
-          </div>
-
-          <div className="scan-card">
-            <div className={`scanner ${status === "scanning" ? "active" : ""}`}>
-              <div className="scanner-ring" />
-              <div className="scanner-core">SCAN</div>
-            </div>
-
-            <div className="scan-copy">
-              <h2>{status === "scanning" ? "Capturing spectral data..." : "Medicine sample"}</h2>
-              <p>
-                Upload the sensor CSV containing six unnamed columns and exactly 10 readings. The readings will be
-                sent to the configured ML service for authentication.
-              </p>
-
-              {status === "scanning" ? (
-                <div className="progress-wrap">
-                  <div className="progress-label">
-                    <span>PROCESSING</span><span>Please wait</span>
-                  </div>
-                  <div className="progress"><div className="progress-fill" /></div>
-                </div>
-              ) : (
-                <div className="scan-controls">
-                  <label className="file-picker">
-                    <span>CHOOSE CSV FILE</span>
-                    <input type="file" accept=".csv,text/csv" onChange={handleCsvChange} />
-                  </label>
-                  <div className="file-status">
-                    {csvFile ? `${csvFile.name} · ${readings.length}/10 readings loaded` : "No CSV selected"}
-                  </div>
-                  <button className="primary" onClick={startScan} disabled={readings.length !== 10}>
-                  START SCAN
-                  </button>
-                </div>
-              )}
-
-              {error && <div className="error">{error}</div>}
-            </div>
-          </div>
-
-          <div className="bottom-note">
-            <span>Raspberry Pi display</span>
-            <span>•</span>
-            <span>AS7262 sensing workflow</span>
-            <span>•</span>
-            <span>Local interface</span>
-          </div>
-        </section>
-      )}
-
-      {screen === "result" && result && (
-        <section className="screen result-screen">
-          <div className="hero center">
-            <span className="eyebrow">AUTHENTICATION RESULT</span>
-            <h1>Sample analysis complete</h1>
-            <p>The authentication backend has returned a result.</p>
-          </div>
-
-          <div className={`result-card ${result.verdict}`}>
-            <div className="result-icon">
-              {result.verdict === "genuine" ? "✓" : result.verdict === "counterfeit" ? "×" : "!"}
-            </div>
-            <div className="result-word">{result.verdict.toUpperCase()}</div>
-            <div className="result-medicine">{result.medicine}</div>
-            <div className="result-metrics">
-              <span>Classification confidence: {result.confidence == null ? "N/A" : Number(result.confidence).toFixed(4)}</span>
-              <span>Anomaly score: {result.anomalyScore == null ? "N/A" : Number(result.anomalyScore).toLocaleString()}</span>
-            </div>
-            <div className="result-description">
-              {result.verdict === "genuine" && "The sample is classified as genuine by the current authentication model."}
-              {result.verdict === "counterfeit" && "The sample is classified as counterfeit by the current authentication model."}
-              {result.verdict === "suspicious" && "The sample requires further verification based on the current authentication result."}
-            </div>
-          </div>
-
-          <div className="result-actions">
-            <button className="secondary" onClick={() => { setResult(null); setStatus("ready"); setScreen("scan"); }}>
-              NEW SCAN
-            </button>
-            <button className="secondary" onClick={fetchResult}>
-              REFRESH RESULT
-            </button>
-          </div>
-
-          <details className="raw-toggle">
-            <summary>VIEW ML RESPONSE</summary>
-            <pre>{JSON.stringify(result.raw, null, 2)}</pre>
-          </details>
-        </section>
-      )}
-    </main>
-  );
+  return <main className="app-shell">
+    <header className="topbar"><div className="brand-lockup"><span className="brand-mark">✦</span><div><div className="brand">MedGuard</div><div className="subtitle">MEDICINE AUTHENTICATION</div></div></div><div className="device-pill">Device: PI_001 <span className={backendOnline ? "online" : "offline"}>● {backendOnline ? "Online" : "Offline"}</span></div></header>
+    {screen === "scan" && <section className="scan-view">
+      <div className="scan-intro"><h1>{status === "scanning" ? "Scanning medicine" : "Ready to Scan"}</h1><p>Place the medicine in the scanner<br />compartment and start scanning.</p></div>
+      <div className={`scan-orbit ${status === "scanning" ? "active" : ""}`}><div className="orbit orbit-one" /><div className="orbit orbit-two" /><button className="scan-trigger" onClick={startScan}><span className="scan-icon">⌁</span><strong>{status === "scanning" ? "SCANNING" : "START SCAN"}</strong></button></div>
+      <div className="scan-input"><label className="upload-button" htmlFor="csv-upload"><span>UPLOAD CSV</span><small>{csvFile ? csvFile.name : "Choose sensor file"}</small></label><input id="csv-upload" type="file" accept=".csv,text/csv" onChange={handleCsvChange} /><span className="reading-count">{readings.length}/10 readings</span></div>
+      {status === "scanning" && <div className="processing"><span /> Capturing spectral signature...</div>}{error && <div className="error">{error}</div>}
+      <div className="scan-facts"><div><b>∿</b><strong>10 Readings</strong><span>Per Scan</span></div><div><b>◷</b><strong>~5 sec</strong><span>Scan Time</span></div><div><b>♢</b><strong>AI + Spectral</strong><span>Analysis</span></div></div>
+      <div className="how-it-works"><h2>⌁ &nbsp;How it works</h2><div className="steps"><div><b>1</b><strong>Place Medicine</strong><span>Place the medicine in the scanner compartment</span></div><div><b>2</b><strong>Start Scan</strong><span>Click start and wait while we capture the spectrum.</span></div><div><b>3</b><strong>Get Result</strong><span>View authentication result in the next screen.</span></div></div></div>
+    </section>}
+    {screen === "result" && result && <section className="result-view">
+      <button className="back-button" onClick={newScan}>← &nbsp; Back to Scan</button><div className="result-heading"><h1>Scan Result</h1><p>Scanned on: {formatTimestamp(result.timestamp)}</p></div>
+      <div className={`result-overview ${result.verdict}`}><div className="verdict-panel"><div className="verdict-ring"><span>{result.verdict === "genuine" ? "✓" : result.verdict === "counterfeit" ? "×" : "!"}</span></div><strong>{result.verdict.toUpperCase()}</strong><small>{result.verdict === "genuine" ? "Medicine Verified" : result.verdict === "counterfeit" ? "Authentication Alert" : "Verification Needed"}</small></div><div className="result-main"><h2>{result.medicine}</h2><p>Batch ID: {result.scan?.batch_id || "Not provided"}</p><p>Scan ID: {result.scanId || "Not provided"}</p><div className="metrics"><Metric label="Confidence Score" value={`${confidence}%`} percent={confidence} /><Metric label="Anomaly Score" value={result.anomalyScore == null ? "N/A" : Number(result.anomalyScore).toFixed(2)} percent={anomaly} /></div></div><div className="auth-message"><b>{result.verdict === "genuine" ? "✓" : result.verdict === "counterfeit" ? "×" : "!"}</b><div><strong>{result.verdict === "genuine" ? "This medicine is authentic." : result.verdict === "counterfeit" ? "This medicine appears counterfeit." : "This medicine requires further verification."}</strong><span>{result.verdict === "genuine" ? "The spectral signature matches the reference profile for this medicine." : "The spectral signature did not meet the current authentication threshold."}</span></div></div></div>
+      <div className="analysis-grid"><div className="spectral-card"><h3>Spectral Match Overview</h3><div className="legend"><span>━ Scanned</span><span>┄ Reference</span></div><div className="chart"><div className="chart-lines" /><svg viewBox="0 0 600 180" role="img" aria-label="Spectral match chart"><polyline points="25,120 130,138 225,42 300,65 390,50 480,83 570,125" /><polyline className="reference" points="25,108 130,128 225,55 300,45 390,68 480,72 570,112" /></svg><div className="wavelengths"><span>450</span><span>500</span><span>550</span><span>570</span><span>600</span><span>650</span></div></div></div><div className="features-card"><h3>Top Contributing Features</h3>{["Ratio 550/650", "Norm 550", "Ratio 600/650", "Slope 500-650", "Norm 450"].map((feature, index) => <div className="feature" key={feature}><span>{feature}</span><i><em style={{ width: `${88 - index * 13}%` }} /></i><b>{(0.82 - index * 0.11).toFixed(2)}</b></div>)}</div></div>
+      <div className="result-stats"><div><b>▣</b><span>Readings Used<strong>{result.scanData.n_readings || 10} / 10</strong></span></div><div><b>◷</b><span>Scan Time<strong>4.6 sec</strong></span></div><div><b>∿</b><span>Stability (CV)<strong>{result.scanData.stability_cv == null ? "N/A" : `${(Number(result.scanData.stability_cv) * 100).toFixed(1)}%`}</strong></span></div><div><b>▧</b><span>Device<strong>PI_001</strong></span></div></div>
+      <div className="recent-card"><h3>◷ &nbsp;Recent Scans</h3>{recentScans.map((scan) => <button className="recent-row" key={scan.scan_id} onClick={() => setResult(normalizeResult(scan))}><span className={`status-symbol ${String(scan.final_status || "suspicious").toLowerCase()}`}>◆</span><span>SCN-{String(scan.scan_id).padStart(6, "0")}</span><span>{formatTimestamp(scan.timestamp)}</span><span>{scan.medicine_name || scan.medicine || "Unknown"}</span><b className={`status-chip ${String(scan.final_status || "suspicious").toLowerCase()}`}>{scan.final_status || "SUSPICIOUS"}</b><span>{scan.confidence_score == null ? "-" : Number(scan.confidence_score).toFixed(2)}</span><span>›</span></button>)}</div>
+      <div className="result-actions"><button className="secondary" onClick={newScan}>NEW SCAN</button><button className="secondary" onClick={fetchResult}>REFRESH RESULT</button></div>{error && <div className="error">{error}</div>}
+    </section>}
+    <footer>MedGuard Medicine Authentication System <span>✦</span></footer>
+  </main>;
 }
 
 createRoot(document.getElementById("root")).render(<App />);
