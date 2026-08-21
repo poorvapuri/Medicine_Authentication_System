@@ -1,0 +1,383 @@
+MEDICINE AUTHENTICATION SYSTEM
+DATA DESIGN
+============================
+
+1. SYSTEM PURPOSE
+
+The system captures six-channel optical readings from an AS7262 sensor,
+processes one scan containing 10 readings through the ML inference pipeline,
+stores the result locally on the Raspberry Pi, displays the result in the
+frontend, and synchronizes local records to Neon PostgreSQL when internet
+connectivity is available.
+
+SQLite is the local source of truth. Cloud PostgreSQL is a synchronized copy
+for centralized storage and analysis. The system must continue operating when
+the cloud is unavailable.
+
+
+2. HIGH-LEVEL DATA FLOW
+
+Raspberry Pi sensor or CSV file
+    |
+    | 10 rows, 6 numeric columns per row
+    v
+Frontend CSV parser
+    |
+    | POST /api/scans/analyze
+    | { "readings": [ ...10 reading objects... ] }
+    v
+FastAPI backend
+    |
+    | calls ml_inference.authenticate_scan(readings)
+    v
+ML inference pipeline
+    |
+    | aggregates 10 readings
+    | classifies medicine
+    | calculates anomaly score
+    | creates final status and explainability
+    v
+Backend normalization and local persistence
+    |
+    | SQLite scans row with sync_status = pending
+    v
+Frontend result display
+    |
+    v
+Background synchronization worker
+    |
+    | when PostgreSQL is reachable
+    v
+Neon PostgreSQL scans table
+
+
+3. SENSOR INPUT DESIGN
+
+One scan consists of exactly 10 sensor readings.
+
+Each reading contains exactly six numeric channels, in this order:
+
+1. ch450
+2. ch500
+3. ch550
+4. ch570
+5. ch600
+6. ch650
+
+CSV format:
+
+1000,1200,1400,1500,1300,900
+1001,1201,1401,1501,1301,901
+1002,1202,1402,1502,1302,902
+1003,1203,1403,1503,1303,903
+1004,1204,1404,1504,1304,904
+1005,1205,1405,1505,1305,905
+1006,1206,1406,1506,1306,906
+1007,1207,1407,1507,1307,907
+1008,1208,1408,1508,1308,908
+1009,1209,1409,1509,1309,909
+
+CSV rules:
+- No header row is expected.
+- Empty lines are ignored.
+- Exactly 10 non-empty rows are required.
+- Exactly 6 columns are required in every row.
+- Every value must be numeric.
+- The frontend preserves row order.
+
+Frontend representation of one reading:
+
+{
+  "ch450": 1000.0,
+  "ch500": 1200.0,
+  "ch550": 1400.0,
+  "ch570": 1500.0,
+  "ch600": 1300.0,
+  "ch650": 900.0
+}
+
+
+4. FRONTEND TO ML REQUEST
+
+Endpoint:
+POST /api/scans/analyze
+
+Request body:
+
+{
+  "readings": [
+    {
+      "ch450": 1000.0,
+      "ch500": 1200.0,
+      "ch550": 1400.0,
+      "ch570": 1500.0,
+      "ch600": 1300.0,
+      "ch650": 900.0
+    }
+  ]
+}
+
+The actual request contains 10 reading objects in the readings array.
+The backend validates the request shape using ScanAnalysisRequest.
+
+
+5. ML PROCESSING DESIGN
+
+The ML pipeline receives the 10 readings and performs the following steps:
+
+1. Validate the readings.
+2. Calculate an aggregated reading for each spectral channel.
+3. Calculate standard deviation and measurement stability.
+4. Perform medicine classification.
+5. Calculate classification confidence.
+6. Run medicine-aware anomaly detection.
+7. Compare anomaly score with genuine/counterfeit thresholds.
+8. Produce a final status.
+9. Produce explainability information.
+
+Supported final statuses:
+- GENUINE
+- COUNTERFEIT
+- SUSPICIOUS
+
+Classification confidence is normally between 0.0 and 1.0.
+Anomaly score is a non-negative model score and is not restricted to 0.0-1.0.
+
+Expected ML result structure:
+
+{
+  "medicine": "Dolonex",
+  "classification_confidence": 0.5481,
+  "anomaly_score": 51430928427314.336,
+  "classification_status": "LOW",
+  "anomaly_status": "COUNTERFEIT",
+  "final_status": "COUNTERFEIT",
+  "explainability": { ... },
+  "scan_data": {
+    "n_readings": 10,
+    "aggregated_reading": {
+      "ch450": 1000.0,
+      "ch500": 1200.0,
+      "ch550": 1400.0,
+      "ch570": 1500.0,
+      "ch600": 1300.0,
+      "ch650": 900.0
+    },
+    "channel_std": { ... },
+    "stability_cv": 0.0057
+  },
+  "classification_probabilities": { ... }
+}
+
+
+6. SQLITE DATA MODEL
+
+Database file:
+backend/local_scans.db
+
+6.1 batches table
+
+Column                 Type       Null   Key/meaning
+---------------------  ---------  -----  ------------------------------
+batch_id               TEXT       No     Primary key
+medicine_name          TEXT       Yes    Medicine name
+manufacturer           TEXT       Yes    Manufacturer name
+batch_number           TEXT       Yes    Manufacturer batch number
+manufacturing_date    DATE       Yes    Date of manufacture
+expiry_date            DATE       Yes    Expiry date
+created_at             DATETIME   No     UTC creation timestamp
+
+Relationship:
+- One batch can have many scans.
+- scans.batch_id references batches.batch_id.
+
+6.2 scans table
+
+Column                 Type       Null   Key/meaning
+---------------------  ---------  -----  ------------------------------
+id                     INTEGER    No     Auto-increment primary key
+scan_id                INTEGER    Yes    Unique application scan identifier
+device_id              TEXT       No     Raspberry Pi device identity
+batch_id               TEXT       Yes    Foreign key to batches.batch_id
+medicine_name          TEXT       Yes    Predicted or supplied medicine
+timestamp              DATETIME   No     UTC scan creation time
+channel_1              FLOAT      Yes    Maps to ch450 aggregate
+channel_2              FLOAT      Yes    Maps to ch500 aggregate
+channel_3              FLOAT      Yes    Maps to ch550 aggregate
+channel_4              FLOAT      Yes    Maps to ch570 aggregate
+channel_5              FLOAT      Yes    Maps to ch600 aggregate
+channel_6              FLOAT      Yes    Maps to ch650 aggregate
+classification         TEXT       Yes    Genuine/Counterfeit/Suspicious
+confidence_score       FLOAT      Yes    Normalized classification confidence
+anomaly_score          FLOAT      Yes    Non-negative anomaly model score
+classification_status  TEXT       Yes    HIGH/MEDIUM/LOW
+anomaly_status         TEXT       Yes    GENUINE/COUNTERFEIT/SUSPICIOUS
+final_status            TEXT       Yes    GENUINE/COUNTERFEIT/SUSPICIOUS
+number_of_readings     INTEGER    Yes    Normally 10
+stability_cv           FLOAT      Yes    Measurement stability value
+ml_result              JSON       Yes    Complete original ML response
+sync_status            TEXT       No     pending or synced
+
+Key behavior:
+- id is the local database primary key and auto-increments.
+- scan_id is unique when supplied by the application.
+- If scan_id is missing, the backend uses the generated id.
+- Frontend/ML fields are nullable to support incomplete input or results.
+- A scan is saved locally before cloud synchronization.
+
+
+7. POSTGRESQL DATA MODEL
+
+Database: Neon PostgreSQL
+
+The cloud scans table mirrors the local scans data required for reporting
+and synchronization.
+
+Cloud-specific details:
+- id is BIGSERIAL PRIMARY KEY.
+- scan_id is BIGINT and required for cloud sync.
+- (device_id, scan_id) is a UNIQUE constraint.
+- ml_result is stored as JSONB.
+- channel values and model scores use DOUBLE PRECISION.
+- PostgreSQL migration file:
+  backend/postgres_migrations/create_tables.sql
+
+Cloud uniqueness rule:
+
+UNIQUE (device_id, scan_id)
+
+This prevents duplicate cloud rows when a pending local record is retried or
+the Raspberry Pi application restarts.
+
+
+8. LOCAL-FIRST SYNCHRONIZATION
+
+Initial state:
+- New scan is inserted into SQLite with sync_status = pending.
+
+Sync worker behavior:
+1. Select up to 100 pending scans.
+2. Insert them into PostgreSQL in a batch.
+3. Use ON CONFLICT (device_id, scan_id) DO NOTHING.
+4. Mark local scans as synced only after PostgreSQL accepts the batch.
+5. Leave scans pending if PostgreSQL is unavailable or rejects the batch.
+6. Retry later using a periodic wait and bounded exponential backoff.
+
+Default timing:
+- Normal sync interval: 300 seconds.
+- Retry backoff starts at 30 seconds.
+- Backoff increases to 60, 120, 240, then 300 seconds.
+- Maximum retry delay: 300 seconds.
+
+Failure behavior:
+- No internet does not block local scan creation.
+- Failed cloud writes do not delete local data.
+- Pending records survive application restarts.
+- A valid PostgreSQL connection and matching schema are required for upload.
+
+
+9. API DATA CONTRACTS
+
+POST /api/scans/
+- Saves an already-computed scan or ML result locally.
+- Returns the saved scan.
+
+POST /api/scans/analyze
+- Accepts 10 raw six-channel readings.
+- Runs local ML inference.
+- Saves the ML result in SQLite.
+- Returns both result and saved scan.
+
+GET /api/scans/
+- Returns scans ordered by newest timestamp.
+- Supports skip and limit query parameters.
+
+GET /api/scans/{scan_id}
+- Returns one scan by scan_id.
+
+POST /api/batches/
+- Creates a batch.
+- Batch input metadata is nullable except batch_id.
+
+GET /api/batches/
+- Lists batches.
+
+GET /api/batches/{batch_id}
+- Returns one batch.
+
+GET /api/dashboard/stats
+- Returns total, genuine, counterfeit, suspicious, and pending-sync counts.
+
+GET /api/dashboard/trends
+- Returns scan counts grouped by date.
+
+GET /api/dashboard/risk
+- Returns average anomaly score.
+
+GET /health
+- Returns { "status": "ok" }.
+
+
+10. CONFIGURATION DATA
+
+Environment variables used by the backend:
+
+DEVICE_ID
+- Device identity, for example PI_001.
+
+DATABASE_URL
+- Local SQLite connection string.
+- Default: sqlite:///./local_scans.db
+
+POSTGRES_URL
+- Neon PostgreSQL connection string.
+- Must contain valid current credentials.
+- Use sslmode=require for Neon.
+
+SYNC_INTERVAL_SECONDS
+- Base periodic synchronization interval.
+
+SYNC_RETRY_BACKOFF_SECONDS
+- Initial retry delay after failure.
+
+SYNC_RETRY_MAX_SECONDS
+- Maximum retry delay.
+
+
+11. DATA SECURITY AND OPERATIONAL NOTES
+
+- Do not commit .env files or database credentials.
+- Rotate any database password that has been exposed.
+- Keep local SQLite as the offline source of truth.
+- Use one backend worker on the Raspberry Pi.
+- Do not mark a row synced before cloud confirmation.
+- Do not delete local rows after synchronization unless a separate retention
+  policy is deliberately introduced.
+- The ML output is a screening result and should not be represented as a
+  laboratory chemical analysis.
+
+
+12. CURRENT KNOWN DEPENDENCIES
+
+Backend:
+- FastAPI
+- Uvicorn
+- SQLAlchemy
+- SQLite
+- psycopg2-binary
+- Pydantic settings
+
+ML runtime:
+- NumPy
+- Pandas
+- scikit-learn
+- SciPy
+- Joblib
+
+Frontend:
+- React
+- Vite
+- Browser File API for CSV upload
+
+
+END OF DATA DESIGN
